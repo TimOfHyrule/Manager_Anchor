@@ -289,10 +289,18 @@ fi
 
 # ── This agent's own instruction ─────────────────────────────────────────
 #
-# The shared half (RULES.md) is fetched by its own hook and reaches every agent.
-# This is the half only this agent gets, and it lives in Tama-AgentManager
-# beside the register rather than in this repository, so that adding an agent
-# does not mean writing one.
+# BOTH halves, in one request: the shared rules every agent is held to, and the
+# half only this agent gets. They live in the manager beside the register
+# rather than in this repository, so that adding an agent does not mean writing
+# one.
+#
+# The shared half used to arrive separately, by its own hook, curling a file
+# out of a public repository. That hook is gone: the repository went private,
+# so it fetched a 404 and printed "the shared agent rules could not be fetched"
+# at the start of every session -- while the rules were arriving here, in this
+# request, perfectly. A warning that is wrong every time is one people learn to
+# scroll past, which is the opposite of what a warning about missing rules is
+# for.
 #
 # The cost of that is real and is why this warning is worded the way it is: a
 # CLAUDE.md is read by the harness itself before anything runs, and this is
@@ -387,9 +395,14 @@ if BEHAVIOR=$(curl -fsS --max-time 10 "$MANAGER_URL/instruction" \
 REREAD
 else
   rm -f .kit/behavior.json
-  echo "WARNING: this agent's instruction could not be fetched from the manager."
-  echo "You have the shared rules and nothing specific to $AGENT. Say so before doing any work,"
-  echo "and do not reconstruct it from what happens to be in this repository."
+  # "You have the shared rules" was true when they came from a second hook and
+  # is false now that one request carries both. Getting that wrong here is
+  # worse than anywhere else in this script: it is a reassurance, given at the
+  # exact moment the session has nothing, to a reader who would otherwise stop.
+  echo "WARNING: no instruction could be fetched from the manager -- neither the shared rules"
+  echo "every agent is held to, nor anything specific to $AGENT. This session has NOTHING"
+  echo "governing it. Say so before doing any work, and do not reconstruct either half from"
+  echo "what happens to be in this repository."
   echo "The work-ethic hook has nothing to read either, so nothing is constraining your"
   echo "decisions except what is already in this context."
 fi
