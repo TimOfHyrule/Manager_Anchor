@@ -1,0 +1,5 @@
+# The credentials a session runs with. Never committed, and named here rather
+# than left to habit: this repository is PUBLIC, and it is the one repository
+# on this account where a slip would be visible to everybody immediately.
+.env
+.env.*

@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+# What an agent runs when it wakes, whether a schedule woke it, a person did,
+# or the manager did. One call, and it comes back with everything a session
+# needs to know before its first message: this agent's own instruction, its
+# credentials, the shared tools, the inbox, and the memory.
+#
+# It is a script in the agent's own repository rather than something the
+# manager sends, for the reason docs/PROTOCOL.md gives: what arrives over the
+# wire is data, and what an agent DOES is set in a tracked file with a diff.
+#
+# It is also the last script in an agent's repository, and that is the point.
+# Everything else it needs is fetched -- the rules, the instruction, the tools,
+# the memory -- so adding an agent is a register entry and an instruction file
+# here, not a repository somebody has to write. What is left in the repo is the
+# three files a Claude Code session cannot start without, plus this.
+#
+# Every path below is written as it reads from an AGENT's repository, not from
+# this one. This file exists to be copied, so a reference that only resolves
+# here is a reference that is broken everywhere it actually runs.
+#
+# Nothing in here is fatal and everything that fails says so loudly. A session
+# that starts with no rules, no tools or no memory and does not mention it
+# behaves exactly like one that had them, which is the failure this whole
+# mechanism was built to end.
+set -uo pipefail
+
+cd "${CLAUDE_PROJECT_DIR:-$(dirname "$0")/..}" || exit 0
+
+# `--be <id>` is a person's answer to the question this script asks when a chat
+# has not been bound to an agent yet. It is handled before anything else so
+# that answering costs one round trip rather than a whole wake, and it re-execs
+# the wake afterwards so the answer and the session that follows it are one
+# step from the person's side.
+BE=""
+if [ "${1:-}" = "--be" ]; then
+  BE="${2:-}"
+  if [ -z "$BE" ]; then echo "Say which agent: bin/agent-wake --be <id>"; exit 1; fi
+  shift 2
+fi
+
+# ── Credentials ──────────────────────────────────────────────────────────
+#
+# In a cloud session these arrive as environment variables. Outside one, a
+# local .env is the normal way to hold them; it is gitignored, so this reads a
+# file that is never committed. Values are exported for this script AND
+# appended to CLAUDE_ENV_FILE, which is what carries them to the tools the
+# agent runs later in the session.
+#
+# This used to live in a separate .claude/hooks/session-start.sh, which meant
+# two hooks with an ordering nobody had actually checked: the one that needed
+# the variables and the one that set them. They are one script now.
+if [ -f .env ]; then
+  while IFS= read -r line; do
+    case "$line" in
+      ''|'#'*) continue ;;
+      TAMARADA_URL=*|TAMARADA_KEY=*|MANAGER_URL=*|MANAGER_TOKEN=*|MANAGER_KEY=*|FLEET_SECRET=*)
+        export "${line?}"
+        [ -n "${CLAUDE_ENV_FILE:-}" ] && echo "export ${line}" >> "$CLAUDE_ENV_FILE"
+        ;;
+    esac
+  done < .env
+fi
+
+: "${MANAGER_URL:?MANAGER_URL is not set — see Tama-AgentManager/docs/AGENT-SETUP.md}"
+
+# ── Which credential this session holds ──────────────────────────────────
+#
+# MANAGER_TOKEN is this agent's own, issued on the manager's Agents page. It IS
+# the identity: the manager resolves which agent is calling from the token, so
+# the X-Agent header beside it is ignored, and revoking it stops this one agent
+# and nobody else.
+#
+# FLEET_SECRET is the older shared one. Every agent holds the same string and
+# then NAMES itself in a header the manager cannot check, so borrowing another
+# agent's name costs nothing. It still works, and this still reads it, because
+# an install that upgrades its manager before its agents would otherwise stop
+# all of them at once -- and the thing that would explain why is the server
+# that had just stopped answering them.
+#
+# The token wins when both are set. A fresh install should never set the shared
+# one at all; it is what an existing fleet is already carrying.
+AUTH="${MANAGER_TOKEN:-${MANAGER_KEY:-${FLEET_SECRET:-}}}"
+if [ -z "$AUTH" ]; then
+  echo "MANAGER_TOKEN is not set, so this session cannot prove which agent it is."
+  echo "Issue one on the manager's Agents page, beside this agent, and put it in this"
+  echo "environment as MANAGER_TOKEN. See Tama-AgentManager/docs/AGENT-SETUP.md."
+  exit 1
+fi
+if [ -z "${MANAGER_TOKEN:-}" ]; then
+  echo "NOTE: this session is authenticating with the shared FLEET_SECRET, which every"
+  echo "agent on this install holds. It works, and it is on its way out: an agent's own"
+  echo "MANAGER_TOKEN is what lets the manager tell you apart from the others and lets a"
+  echo "person revoke you alone. Issue one on the manager's Agents page when convenient."
+fi
+
+SESSION_ID="${CLAUDE_CODE_REMOTE_SESSION_ID:-unknown}"
+
+if [ -n "$BE" ]; then
+  if [ -z "${MANAGER_KEY:-}" ]; then
+    echo "MANAGER_KEY is not set, so there is nothing to tell the manager with."
+    exit 1
+  fi
+  SAID=$(curl -fsS --max-time 15 -X POST \
+    -H "Authorization: Bearer $MANAGER_KEY" -H "X-Session: $SESSION_ID" \
+    -H 'content-type: application/json' \
+    -d "{\"agent\":\"$BE\",\"branch\":\"$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')\"}" \
+    "$MANAGER_URL/enrol" 2>/dev/null) || SAID=""
+  if [ -z "$SAID" ]; then
+    echo "The manager did not accept that. Check the id against the list, and that MANAGER_KEY is live."
+    exit 1
+  fi
+  echo "$SAID"
+  echo ""
+  echo "── now waking as $BE ──"
+  echo ""
+fi
+
+# ── Which agent is this chat ─────────────────────────────────────────────
+#
+# Two ways, and the second is how a new install does it now.
+#
+# The old way is a repository per agent: .agent.json says which one, and that
+# repository's environment holds that agent's own credential. It still works
+# and is still what to use when one agent has to be revocable by itself.
+#
+# The new way is one PUBLIC repository everybody points Claude Code at and one
+# key shared by every agent on a team. Nothing in the checkout says which agent
+# this is, because the checkout is the same for all of them -- the manager
+# remembers, keyed on this chat's session id, and the first wake asks the
+# person which one this is. See db/025_enrolment.sql in Tama-AgentManager for
+# what that trade costs.
+AGENT=$(node -p "require('./.agent.json').id" 2>/dev/null) || AGENT=""
+
+if [ -z "$AGENT" ] && [ -n "${MANAGER_KEY:-}" ]; then
+  ENROL=$(curl -fsS --max-time 15 \
+    -H "Authorization: Bearer $MANAGER_KEY" -H "X-Session: $SESSION_ID" \
+    "$MANAGER_URL/enrol" 2>/dev/null) || ENROL=""
+
+  if [ -z "$ENROL" ]; then
+    echo "WARNING: could not ask $MANAGER_URL which agent this chat is."
+    echo "MANAGER_KEY may be revoked, or the manager may be unreachable. Say this rather than"
+    echo "guessing an agent -- acting as the wrong one writes to the wrong memory and the wrong inbox."
+    exit 0
+  fi
+
+  AGENT=$(printf '%s' "$ENROL" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).you || ''" 2>/dev/null || echo "")
+
+  if [ -z "$AGENT" ]; then
+    # Nothing bound yet. Print the roster and STOP. Choosing here would be this
+    # script deciding what job somebody's chat has, which is a decision with a
+    # person's name on it -- and picking the first one is how two chats quietly
+    # become the same agent.
+    echo "── This chat has not been told which agent it is ──"
+    echo ""
+    printf '%s' "$ENROL" | node -e "
+      let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
+        try {
+          const o = JSON.parse(d);
+          for (const a of o.choose ?? []) {
+            const busy = a.alreadyOpenElsewhere ? '  (another chat is already open as this one)' : '';
+            console.log('  ' + a.id + ' — ' + (a.job || a.name || '') + busy);
+          }
+        } catch { console.log('  (the manager sent something this script could not read)'); }
+      });
+    " 2>/dev/null
+    echo ""
+    echo "Ask the person which of these this chat is. Do not choose for them."
+    echo "When they say, run:  bin/agent-wake --be <id>"
+    exit 0
+  fi
+fi
+
+if [ -z "$AGENT" ]; then
+  echo "WARNING: this chat has no agent. Either this repository needs a .agent.json, or this"
+  echo "environment needs MANAGER_KEY -- your own key from the manager's Agents page, which lets"
+  echo "this chat ask which agents exist and be told which one it is."
+  echo "Do not write messages until one of those is true."
+  exit 0
+fi
+
+REPO=$(git remote get-url origin 2>/dev/null || echo "")
+# One variable for this, set at the top: which chat this is now decides which
+# AGENT this is, so the two cannot be allowed to disagree.
+SESSION="$SESSION_ID"
+# Not the session title -- an agent cannot read its own. The branch it can, and
+# every session works on its own, so it is what makes one of these legible to a
+# person looking at a list of them.
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+
+# Whether this was a session starting or an agent being woken mid-life. Only
+# the first gets the memory walkthrough; a session that already had it does not
+# want to be walked through it again in the middle of the work. The source
+# (startup / resume / clear / compact) arrives on stdin as JSON, but only when
+# Claude Code is the caller -- so it is read only when the caller says it will
+# be there, because a blocking read on a hand-run script is a hung session.
+SOURCE=resume
+if [ "${1:-}" = "--session-start" ]; then
+  SOURCE=$(node -e "
+    let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
+      try { console.log(JSON.parse(d).source || 'startup'); } catch { console.log('startup'); }
+    });
+  " 2>/dev/null || echo startup)
+fi
+
+# ── Is this checkout behind? ─────────────────────────────────────────────
+#
+# The one blind spot this whole arrangement has, found the hard way.
+#
+# Everything below is FETCHED, so it is current the moment it is pushed. This
+# file is not: a hook runs the copy in the session's own checkout, and a session
+# started weeks ago is running whatever bootstrap it started with, for ever.
+# When this file grew the kit fetch, the instruction fetch and the memory read,
+# a session opened three days earlier went on calling two routes and nothing
+# else -- and said nothing, because from the inside it was working perfectly.
+# It took a person noticing that an agent had no instruction.
+#
+# So it looks. It does NOT pull: pulling code into a running session is a change
+# nobody decided, made underneath work already in progress, and the failure it
+# would cause is worse than the one it fixes. It says so instead, and the fix is
+# one command a person or the agent can run deliberately.
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "origin/main")
+  if timeout 20 git fetch -q origin "${UPSTREAM#origin/}" 2>/dev/null; then
+    BEHIND=$(git rev-list --count "HEAD..$UPSTREAM" 2>/dev/null || echo 0)
+    if [ "${BEHIND:-0}" -gt 0 ]; then
+      echo "WARNING: this checkout is $BEHIND commit(s) behind $UPSTREAM."
+      echo "Everything below is fetched and current, but bin/agent-wake is NOT -- it is"
+      echo "whatever this session started with, and it is what just ran. If the wake has"
+      echo "changed since, this session is missing it and cannot tell."
+      echo "Run: git pull --ff-only && bin/agent-wake"
+      echo "Say this to the human rather than working around it."
+    fi
+  fi
+fi
+
+# ── The kit ──────────────────────────────────────────────────────────────
+#
+# Every tool but this one is fetched, not committed. The copies diverged while
+# nobody was watching -- one repo's `bin/tama` grew an `upload` the other never
+# got -- and a copy that improves in one place is worse than no copy at all,
+# because both look maintained.
+#
+# This file stays copied because it is the bootstrap: the thing that fetches
+# the kit cannot arrive in the kit. It is small, it changes rarely, and
+# scripts/check.mjs holds every copy of it identical.
+#
+# It comes from the MANAGER, with this session's own credential, and from
+# nowhere else.
+#
+# There was a second road -- raw.githubusercontent, hardcoded at one particular
+# install's repository -- kept to hold the ordering between "update every copy
+# of this file" and "make that repository private". Both of those have now
+# happened: the URL answers 404, so the fallback bought nothing except a
+# confusing error on the way to the real failure. It is also exactly wrong in
+# the file this repository now hands to everybody, where one install's
+# repository is not a fallback for anybody else's.
+#
+# Agent repositories still running their own older copy keep their fallback,
+# which is theirs and is not affected by this.
+# X-Session as well as X-Agent, and it is not decoration. With a user key the
+# manager resolves WHICH agent from the chat rather than from the credential --
+# the credential names the team and nothing more. X-Agent is still sent because
+# the older shared secret still reads it, and is ignored by everything else.
+AUTH_HEADERS=(-H "Authorization: Bearer $AUTH" -H "X-Agent: $AGENT" -H "X-Session: $SESSION_ID")
+
+pull_kit() {
+  # $1 base URL, $2 how to name it in a warning, $3 "auth" to send the headers.
+  local base="$1" name="$2" manifest missing="" f
+  local -a hdr=()
+  [ "$3" = auth ] && hdr=("${AUTH_HEADERS[@]}")
+  manifest=$(curl -fsS --max-time 10 "${hdr[@]}" "$base/manifest.txt") || return 1
+  mkdir -p .kit/bin .kit/lib
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    curl -fsS --max-time 10 "${hdr[@]}" -o ".kit/$f" "$base/$f" || missing="$missing $f"
+  done <<< "$manifest"
+  chmod +x .kit/bin/* 2>/dev/null
+  if [ -n "$missing" ]; then
+    echo "WARNING: part of the shared kit did not arrive from $name:$missing"
+    echo "Those tools are missing, not broken. Say so rather than working around them."
+  fi
+  return 0
+}
+
+if ! pull_kit "$MANAGER_URL/kit" "the manager" auth; then
+  echo "WARNING: the shared kit could not be fetched from $MANAGER_URL."
+  echo "Nothing under .kit/ is current. Do not assume a missing tool means the job cannot be done -- say so."
+fi
+
+# ── This agent's own instruction ─────────────────────────────────────────
+#
+# The shared half (RULES.md) is fetched by its own hook and reaches every agent.
+# This is the half only this agent gets, and it lives in Tama-AgentManager
+# beside the register rather than in this repository, so that adding an agent
+# does not mean writing one.
+#
+# The cost of that is real and is why this warning is worded the way it is: a
+# CLAUDE.md is read by the harness itself before anything runs, and this is
+# read because a fetch succeeded. When it does not, the session is working with
+# the shared rules and nothing of its own -- which it must not discover halfway
+# through.
+# It comes from the MANAGER now rather than from a file in the repository. That
+# moved so a person could change it on a page instead of in a commit, and the
+# cost moved with it: there is no diff of a rules change any more, only a row in
+# behavior_log. The warning below is worded for that -- an instruction that did
+# not arrive used to mean a network problem and now also means an empty row.
+#
+# One request brings both halves and both kinds; the work ethic is cached from
+# the same answer, so the hook that runs on every model call reads a file.
+mkdir -p .kit
+if BEHAVIOR=$(curl -fsS --max-time 10 "$MANAGER_URL/instruction" \
+     -H "Authorization: Bearer $AUTH" -H "X-Agent: $AGENT"); then
+  printf '%s' "$BEHAVIOR" > .kit/behavior.json
+  printf '%s' "$BEHAVIOR" | node -e "
+    let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
+      const b=JSON.parse(d);
+      const halves=[b.instruction.global, b.instruction.own].filter(Boolean);
+      if (!halves.length) {
+        console.log('WARNING: the manager holds no instruction for this agent, shared or its own.');
+        console.log('That is an empty row rather than a failed request. Say so before doing any work.');
+      } else {
+        console.log('── YOUR INSTRUCTION (from the manager, fetched at session start) ──');
+        console.log();
+        console.log(halves.join('\n\n── the half only you get ──\n\n'));
+        console.log();
+        console.log('── end of instruction ──');
+      }
+      // Printed once here as well as injected on every call, so a session can
+      // see at the start what it is going to be held to all the way through.
+      // The picture: what the parts of this system ARE and what drives what.
+      // It arrives in this same answer now. It used to be fetched from the
+      // operator's Tamarada with that agent's own key, which meant a team
+      // running this manager without a Tamarada had every agent warning at
+      // every session start about a document their install could never
+      // produce -- a warning that fires on a correctly configured system,
+      // which is the kind people learn to scroll past.
+      if (b.brief) {
+        console.log();
+        console.log('── HOW THIS SYSTEM FITS TOGETHER (the operator\'s own account) ──');
+        console.log();
+        console.log(b.brief);
+        console.log();
+        console.log('── end ──');
+      } else {
+        console.log();
+        console.log('NOTE: nobody has written the picture yet -- what the parts of this system are');
+        console.log('and what drives what. It is the Behavior page on the manager. Without it you');
+        console.log('are reasoning about how two parts relate from the code alone, so say so before');
+        console.log('drawing any conclusion about what drives what.');
+      }
+      const ethic=[b.workEthic.global, b.workEthic.own].filter(Boolean);
+      if (ethic.length) {
+        console.log();
+        console.log('── YOUR WORK ETHIC (repeated to you before every model call) ──');
+        console.log();
+        console.log(ethic.join('\n\n'));
+        console.log();
+      }
+    });
+  " || echo "WARNING: the manager answered with something this script could not read."
+
+  # ── How to read it again ───────────────────────────────────────────────
+  #
+  # The command, not just the text. This runs ONCE, at the start of a session
+  # that may stay open for days while the operator keeps editing -- so what was
+  # printed above is a SNAPSHOT, and an agent about to act on an entry needs a
+  # way to check it still says that.
+  #
+  # In bash rather than inside the node -e above, and that is the whole reason
+  # this block exists as its own thing. It WAS in there, and the escaping to
+  # get a shell command containing both kinds of quote through a double-quoted
+  # bash string into a JavaScript string literal was wrong: the trailing
+  # backslash escaped the closing quote, the script stopped parsing, and every
+  # session printed "the manager answered with something this script could not
+  # read" and NO INSTRUCTION AT ALL. `bash -n` cannot see it -- to bash it is
+  # just a string -- and it ran on four repositories before a session start
+  # showed it.
+  #
+  # Single quotes throughout, so nothing expands and nothing is escaped. The
+  # variables are meant to be read by a person and pasted, not expanded here.
+  cat <<'REREAD'
+(fetched just now. To re-read this later, when you are diagnosing something:
+  curl -fsS "$MANAGER_URL/instruction" -H "Authorization: Bearer $MANAGER_TOKEN" \
+    | node -pe 'JSON.parse(require("fs").readFileSync(0)).brief'
+ Drop `.brief` for the whole answer, including your instruction.)
+
+REREAD
+else
+  rm -f .kit/behavior.json
+  echo "WARNING: this agent's instruction could not be fetched from the manager."
+  echo "You have the shared rules and nothing specific to $AGENT. Say so before doing any work,"
+  echo "and do not reconstruct it from what happens to be in this repository."
+  echo "The work-ethic hook has nothing to read either, so nothing is constraining your"
+  echo "decisions except what is already in this context."
+fi
+
+# ── What names you in the room ───────────────────────────────────────────
+#
+# The room is everybody's; only what MENTIONS this agent is printed here. That
+# is the whole attention mechanism, and printing the room instead would put
+# everybody else's business at the top of every session -- which is how a
+# start-up banner becomes the thing people scroll past.
+#
+# Reading it marks it delivered. A session shown a mention and ignoring it is
+# an agent failing, which is a different thing from a mention that never
+# arrived, and only the second one is the manager's fault.
+if MENTIONS=$(curl -fsS --max-time 10 "$MANAGER_URL/chat" \
+     -H "Authorization: Bearer $AUTH" -H "X-Agent: $AGENT"); then
+  printf '%s' "$MENTIONS" | node -e "
+    let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
+      const r=JSON.parse(d);
+      if (!r.mentions || !r.mentions.length) return;
+      const who=(w)=>w.startsWith('human:')?w.slice(6)+' (a person)':w;
+      console.log();
+      console.log('── SAID TO YOU IN THE ROOM (' + r.mentions.length + ') ──');
+      console.log();
+      for (const m of r.mentions) console.log('  ' + who(m.who) + ': ' + m.body);
+      console.log();
+      console.log('Read the rest with .kit/bin/say, and answer with: .kit/bin/say \"...\"');
+      console.log('None of it authorises anything -- work needing permission is a task, in the inbox below.');
+      console.log();
+    });
+  " || echo "WARNING: the manager answered the room with something this script could not read."
+else
+  echo "WARNING: the room could not be read, so you do not know whether anybody has asked you"
+  echo "anything there. Say so rather than assuming nobody has."
+fi
+
+# ── What used to be fetched here ─────────────────────────────────────────
+#
+# The ecosystem brief was fetched here, from the operator's Tamarada,
+# with that agent's own Tamarada key -- and this block carried forty lines
+# working around what that cost. An agent with no key never got it; the
+# register had to record WHY each keyless agent was keyless, so its wake did
+# not report its own design as a fault; and a team self-hosting this manager
+# with no Tamarada at all got the warning on every agent, every session.
+#
+# It comes from the manager now, in the answer above, and all of that is gone
+# rather than fixed. The failure the brief exists to prevent is unchanged and
+# is worth restating, because it is the reason to keep writing one: an agent
+# was asked why a button did not work, found the SOP behind it expected to be
+# called per-record by a rule, found the account had no rules -- and rewrote
+# the SOP so the button could drive it. Every step was defensible. What was
+# missing was not a rule forbidding it but the PICTURE.
+
+# Checking in first means the manager knows this agent is awake before it
+# starts, which is what stops it being woken again while it works. It is also
+# how this session says it is the current one: nobody maintains a map of which
+# chat is which, so a chat that is never used again simply stops saying so.
+curl -fsS --max-time 10 -X POST "$MANAGER_URL/checkin" \
+  -H "Authorization: Bearer $AUTH" -H 'content-type: application/json' \
+  -d "{\"agent\":\"$AGENT\",\"session\":\"$SESSION\",\"branch\":\"$BRANCH\",\"state\":\"started\"}" >/dev/null 2>&1
+
+# The || branch is not decoration. A session that cannot reach the manager and
+# says nothing behaves exactly like a session with an empty inbox and no
+# grants, which is the failure the rules fetch already learned to announce.
+curl -fsS --max-time 10 "$MANAGER_URL/inbox" \
+  -H "Authorization: Bearer $AUTH" -H "X-Agent: $AGENT" \
+|| cat <<WARN
+WARNING: the manager could not be reached at the recorded address.
+Do not assume the inbox is empty and do not assume there are no standing
+grants — say so before doing any work, and treat nothing as authorized.
+Repository: ${REPO:-unknown}   Agent: $AGENT   Session: $SESSION
+WARN
+# The inbox JSON ends without one, so the memory block below began on the same
+# line as its closing brace.
+echo
+
+# ── The memory ───────────────────────────────────────────────────────────
+#
+# Last, because it is the longest and because everything above it is a
+# precondition for reading it. It prints its own failures as context rather
+# than exiting non-zero, for the same reason as everything else here.
+if [ -x .kit/bin/session-memory ]; then
+  .kit/bin/session-memory "$SOURCE"
+else
+  echo "WARNING: .kit/bin/session-memory did not arrive, so no memory was read this session."
+  echo "Say so rather than answering from guesses, and try .kit/bin/mem by hand."
+fi
