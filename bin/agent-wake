@@ -26,6 +26,26 @@ set -uo pipefail
 
 cd "${CLAUDE_PROJECT_DIR:-$(dirname "$0")/..}" || exit 0
 
+# ── How this file is allowed to fail ─────────────────────────────────────
+#
+# Loudly, and with exit 0. Both halves matter and the second is the one that
+# was got wrong.
+#
+# On a SessionStart hook, exit 0 is what puts stdout into the session's
+# context -- that is the entire mechanism by which an agent receives its
+# instruction here. A NON-ZERO exit throws stdout away and shows the human a
+# "hook error" notice carrying the first line of stderr instead.
+#
+# So a failure path that printed to stdout and exited 1 reached nobody: the
+# agent got nothing, and the human got an error notice with an empty reason.
+# That happened, to the first agent set up from the shared repository. It came
+# up with no rules, no tools, no inbox and no memory, and had no way to know --
+# which is the exact failure the top of this file says it exists to end.
+#
+# Hence one helper, used everywhere a hook can reach. stdout is what the agent
+# reads; stderr is for the debug log and for anybody running this by hand.
+warn() { printf '%s\n' "$@"; printf '%s\n' "$@" >&2; }
+
 # `--be <id>` is a person's answer to the question this script asks when a chat
 # has not been bound to an agent yet. It is handled before anything else so
 # that answering costs one round trip rather than a whole wake, and it re-execs
@@ -61,7 +81,12 @@ if [ -f .env ]; then
   done < .env
 fi
 
-: "${MANAGER_URL:?MANAGER_URL is not set — see Tama-AgentManager/docs/AGENT-SETUP.md}"
+if [ -z "${MANAGER_URL:-}" ]; then
+  warn "MANAGER_URL is not set, so this session cannot reach a manager at all." \
+       "It has no instruction, no rules, no tools, no inbox and no memory." \
+       "Say this before doing any work. See Tama-AgentManager/docs/AGENT-SETUP.md."
+  exit 0
+fi
 
 # ── Which credential this session holds ──────────────────────────────────
 #
@@ -81,10 +106,24 @@ fi
 # one at all; it is what an existing fleet is already carrying.
 AUTH="${MANAGER_TOKEN:-${MANAGER_KEY:-${FLEET_SECRET:-}}}"
 if [ -z "$AUTH" ]; then
-  echo "MANAGER_TOKEN is not set, so this session cannot prove which agent it is."
-  echo "Issue one on the manager's Agents page, beside this agent, and put it in this"
-  echo "environment as MANAGER_TOKEN. See Tama-AgentManager/docs/AGENT-SETUP.md."
-  exit 1
+  # Which variable to name depends on which kind of repository this is, and
+  # naming the wrong one sends somebody to the wrong page. A checkout with no
+  # .agent.json is the shared shell: its credential is the person's own key,
+  # and there is no per-agent token to issue because there is no agent yet.
+  if [ -f .agent.json ]; then
+    warn "MANAGER_TOKEN is not set, so this session cannot prove which agent it is." \
+         "Issue one on the manager's Agents page, beside this agent, and put it in this" \
+         "environment as MANAGER_TOKEN."
+  else
+    warn "MANAGER_KEY is not set, so this session cannot reach the manager." \
+         "This repository is the shared shell -- it holds no agent's name, so what it needs" \
+         "is YOUR key: manager, Agents page, \"Setting up a new agent\", Issue a key for" \
+         "yourself. Put it in this environment as MANAGER_KEY."
+  fi
+  warn "" \
+       "Until then this session has no instruction, no rules, no tools, no inbox and no" \
+       "memory. Say that before doing any work. See Tama-AgentManager/docs/AGENT-SETUP.md."
+  exit 0
 fi
 if [ -z "${MANAGER_TOKEN:-}" ]; then
   echo "NOTE: this session is authenticating with the shared FLEET_SECRET, which every"
@@ -272,7 +311,21 @@ pull_kit() {
   mkdir -p .kit/bin .kit/lib
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    curl -fsS --max-time 10 "${hdr[@]}" -o ".kit/$f" "$base/$f" || missing="$missing $f"
+    # Written aside and moved into place only on success. `-f` already stops an
+    # HTTP error from touching the file, but a transfer that dies mid-stream
+    # after a 200 leaves a PARTIAL one -- which is then chmod +x'd and passes
+    # every "is the tool there" check that follows, so a tool that is half a
+    # file looks exactly like a tool that works.
+    #
+    # A temp file and a move rather than curl's --remove-on-error: that flag is
+    # newer than some of the images this runs on, and an unrecognised option
+    # makes curl fail every fetch rather than one.
+    if curl -fsS --max-time 10 "${hdr[@]}" -o ".kit/$f.part" "$base/$f"; then
+      mv -f ".kit/$f.part" ".kit/$f"
+    else
+      rm -f ".kit/$f.part"
+      missing="$missing $f"
+    fi
   done <<< "$manifest"
   chmod +x .kit/bin/* 2>/dev/null
   if [ -n "$missing" ]; then
