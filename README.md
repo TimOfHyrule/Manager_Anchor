@@ -1,26 +1,37 @@
 # An agent's shell
 
-This is the whole repository an agent needs. It has no code, no agent's name in
-it, and nothing to edit — it is the same checkout for every agent on every team,
-which is the point.
+The whole repository an agent needs. No code, no agent's name, nothing to edit —
+the same checkout for every agent on every team, which is the point.
 
 ## Setting one up
 
-1. Start a Claude Code session on this repository.
-2. Put two things in that environment:
+1. **Start a Claude Code session on this repository.** You do not need to fork
+   it; it is public and it is never written to.
+
+2. **Put one variable in that environment.** On the web that is the cloud
+   environment's **Environment variables** box; locally it is a `.env` file
+   beside this README.
 
    ```
-   MANAGER_URL=https://your-manager
-   MANAGER_KEY=ek_…      your own key, from the manager's Agents page
+   MANAGER_KEY=ek_…
    ```
 
-3. The session starts and prints the agents on your team. Say which one this
-   chat is. It runs `bin/agent-wake --be <id>` and that is the setup finished.
+   The key is yours, from the manager's **Agents** page → *Setting up a new
+   agent* → **Issue a key for yourself**. It is shown once.
 
-The same key does every agent on your team. It is yours rather than the team's
-— a teammate issues their own, so losing a laptop or leaving costs one key
-rather than everybody's. Which chat is which agent is remembered by the
-manager, not by anything here.
+   Set it on the ENVIRONMENT, not on one session: every session started
+   afterwards copies it at startup, so you do this once and never again.
+
+3. **Say which agent this chat is.** The session starts, asks the manager which
+   agents are on your team, and prints the list. Answer, and it runs
+   `bin/agent-wake --be <id>` for you. That is the setup finished.
+
+The same key does every agent you set up. Which chat is which agent is
+remembered by the manager, not by anything here — so a chat is wakeable from
+the moment you choose.
+
+`manager-url` holds the address of the manager this repository belongs to. Set
+`MANAGER_URL` in the environment to point somewhere else; it wins.
 
 ## Why there is nothing in here
 
@@ -34,11 +45,19 @@ command in one agent's repository and never in the rest.
 tools cannot itself arrive in them. It is small, it changes rarely, and the
 manager's own copy is the original.
 
+## When something is wrong
+
+The wake never fails silently. If it cannot reach the manager, cannot prove who
+it is, or gets no instruction, it says so in the session's first message and
+keeps going — so a chat that has nothing is a chat that knows it has nothing,
+and tells you. If a session starts and says none of that, it got what it needed.
+
 ## What this is not for
 
 An agent that owns a codebase. A chat that works on your repository has to be
-started on your repository, and that one wants its own credential rather than a
-yours — see **the long way** in the manager's `docs/AGENT-SETUP.md`.
+started on your repository, and that one wants the agent's own credential
+rather than yours — see **the long way** in the manager's
+`docs/AGENT-SETUP.md`.
 
 ## What your key can do
 

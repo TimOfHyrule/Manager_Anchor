@@ -81,10 +81,25 @@ if [ -f .env ]; then
   done < .env
 fi
 
+# ── Where the manager is ─────────────────────────────────────────────────
+#
+# A file in the repository, if there is one, so that the shared shell can carry
+# its own manager's address and a person setting an agent up has one variable
+# to paste instead of two. The environment still wins, so a self-hosted install
+# points at its own without editing anybody's checkout.
+#
+# A file rather than a default in this script, because this script is held
+# byte-identical across every repository that has a copy -- one install's
+# address baked in here would be baked into all of them.
+if [ -z "${MANAGER_URL:-}" ] && [ -f manager-url ]; then
+  MANAGER_URL=$(head -n1 manager-url | tr -d '[:space:]')
+  export MANAGER_URL
+fi
+
 if [ -z "${MANAGER_URL:-}" ]; then
-  warn "MANAGER_URL is not set, so this session cannot reach a manager at all." \
-       "It has no instruction, no rules, no tools, no inbox and no memory." \
-       "Say this before doing any work. See Tama-AgentManager/docs/AGENT-SETUP.md."
+  warn "MANAGER_URL is not set and this checkout names no manager, so this session cannot" \
+       "reach one at all. It has no instruction, no rules, no tools, no inbox and no memory." \
+       "Say so before doing any work, and do not guess at what this session is for."
   exit 0
 fi
 
@@ -121,8 +136,9 @@ if [ -z "$AUTH" ]; then
          "yourself. Put it in this environment as MANAGER_KEY."
   fi
   warn "" \
-       "Until then this session has no instruction, no rules, no tools, no inbox and no" \
-       "memory. Say that before doing any work. See Tama-AgentManager/docs/AGENT-SETUP.md."
+       "This session has no instruction, no rules, no tools, no inbox and no memory." \
+       "If this checkout has a CLAUDE.md, it says what to do about that: helping the person" \
+       "finish setting up IS the job for this session, and there is no other job to guess at."
   exit 0
 fi
 if [ -z "${MANAGER_TOKEN:-}" ]; then
