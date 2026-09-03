@@ -329,7 +329,27 @@ fi
 # user key they reached a manager that could not tell which agent was asking.
 # The instruction, the mentions, the check-in and the inbox all failed at once,
 # in a session that had otherwise started normally.
-AUTH_HEADERS=(-H "Authorization: Bearer $AUTH" -H "X-Agent: $AGENT" -H "X-Session: $SESSION_ID")
+
+# The hash of THIS FILE, sent on every call so the manager can say whether the
+# bootstrap that just ran is the current one.
+#
+# It exists because the check above -- "am I behind my own origin" -- catches a
+# checkout somebody forgot to pull and misses the case that actually happened:
+# a repository perfectly in sync with its own origin, carrying a copy of this
+# script hundreds of lines behind the one every other repository has.
+# Committed, current, and stale, with nothing from the inside to see.
+#
+# The comparison belongs to the manager and not here. Only that side has the
+# canonical bytes, and a script deciding for itself whether it is the current
+# script is the copy under suspicion grading itself.
+#
+# Both command names, because neither is everywhere: sha256sum is coreutils and
+# shasum is what a Mac has. Empty when neither exists, and empty means "did not
+# say" -- the manager treats that as silence rather than as a mismatch, because
+# an install that cannot hash a file is not an install running the wrong one.
+WAKE_SHA=$( { sha256sum "$0" 2>/dev/null || shasum -a 256 "$0" 2>/dev/null; } | cut -d" " -f1 )
+
+AUTH_HEADERS=(-H "Authorization: Bearer $AUTH" -H "X-Agent: $AGENT" -H "X-Session: $SESSION_ID" -H "X-Wake: $WAKE_SHA")
 
 pull_kit() {
   # $1 base URL, $2 how to name it in a warning, $3 "auth" to send the headers.
@@ -404,6 +424,18 @@ if BEHAVIOR=$(curl -fsS --max-time 10 "$MANAGER_URL/instruction" \
   printf '%s' "$BEHAVIOR" | node -e "
     let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
       const b=JSON.parse(d);
+      // First, before the instruction, because it changes how much of the rest
+      // can be trusted: a session running an old bootstrap may have skipped
+      // fetches this one performs, and it cannot tell which.
+      if (b.wake && b.wake.current === false) {
+        console.log('WARNING: this checkout\'s bin/agent-wake is NOT the current one.');
+        console.log('It is committed and may be perfectly in sync with its own origin -- it is still');
+        console.log('an older copy than every other repository has, so this session may be missing');
+        console.log('fetches the current one performs and cannot tell which.');
+        console.log('Copy bin/agent-wake from Tama-AgentManager, commit it, then run it again.');
+        console.log('Say this to the human rather than working around it.');
+        console.log();
+      }
       const halves=[b.instruction.global, b.instruction.own].filter(Boolean);
       if (!halves.length) {
         console.log('WARNING: the manager holds no instruction for this agent, shared or its own.');
