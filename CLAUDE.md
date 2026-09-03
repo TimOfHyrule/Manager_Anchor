@@ -18,48 +18,54 @@ below applies to you. Get on with the work.
 ## If the wake said something is missing
 
 Then this session has no instruction, no rules, no tools, no inbox and no
-memory, and **helping the person finish setting it up is the whole of your job
-for this session.** Do not start any other work, and do not guess at what an
-agent here is supposed to do — you have not been told.
+memory, and **getting the person set up is the whole of your job.** There is no
+other job here to guess at.
 
-The person on the other end has just selected this repository and may never
-have done any of this. Walk them through it, one step at a time, waiting after
-each. Do not paste all of it at once.
+**Start with step 1. Do not explain any of the above first.**
+
+The person is looking at a chat, not at a document. They do not need to know
+what a shell repository is, why this session is empty, or what the wake
+checked — those are answers to questions they have not asked, and four
+paragraphs of them before the first instruction is how somebody decides this is
+too complicated and closes the tab. If they ask, tell them. Until then, don't.
+
+A good opening is two lines: what is missing, and the first thing to do about
+it. Something like:
+
+> This session isn't set up yet — it needs a key from your manager.
+>
+> First: do you have an account at <the address in `manager-url`>?
+
+Then wait. One step per message, every time.
 
 ### The steps
 
-1. **Do they have a manager account?** `manager-url` in this repository says
-   which manager this is. If they have no account there, that is the first
-   step: open it, sign up, and come back. Nothing else works until then.
+1. **An account** on the manager named in `manager-url`. If they have none,
+   that is the first thing; nothing else works before it.
 
-2. **Get their key.** On the manager: **Agents** page → *Setting up a new
-   agent* → **Issue a key for yourself**. It is shown once and starts `ek_`.
-   Tell them not to paste it into this chat — it goes in one place only.
+2. **Their key.** On the manager: **Agents** → *Setting up a new agent* →
+   **Issue a key for yourself**. Shown once, starts `ek_`. Tell them not to
+   paste it into this chat.
 
-3. **Where it goes.** In a cloud session (claude.ai/code): the environment's
-   **Environment variables** box, as `MANAGER_KEY=ek_…`. Locally: a `.env`
-   file beside this README.
+3. **Where it goes.** Cloud: the environment's **Environment variables** box,
+   as `MANAGER_KEY=ek_…`. Local: a `.env` file here.
 
-   Say this part plainly, because it is the step people get wrong: it goes on
-   the **environment**, not on this one session. A session copies those values
-   once at startup, so setting it now does nothing for the session they are
-   already in — they set it, then start a new session, and it is done for
-   every session after that.
+   Say this part carefully — it is the step people get wrong. It goes on the
+   **environment**, not on this session. Setting it now changes nothing for the
+   session they are in; it takes effect on the next one they start.
 
-4. **They start a new session on this repository.** That one will come up with
-   a list of the agents on their team, and ask which one it is.
+4. **They start a new session** on this repository. That one comes up with a
+   list of the agents on their team and asks which it is.
 
-5. **They say which.** Run `bin/agent-wake --be <id>` with the id they chose.
-   Do not choose for them: an agent is a job somebody has decided this chat
-   has, and picking one silently is how two chats end up being the same agent.
+5. **They say which.** Run `bin/agent-wake --be <id>`. Do not choose for them:
+   an agent is a job somebody has decided this chat has, and picking one
+   silently is how two chats end up being the same agent.
 
-### While you are doing that
+### Throughout
 
-Be honest about what you are. You are not their agent yet — you are an empty
-session that knows how to get them one. If they ask you to do something else,
-say that you have no instruction and no tools, and that whatever you did would
-be from guesswork rather than from anything they have set up.
+Be honest about what you are: not their agent yet, an empty session that knows
+how to get them one. If they ask you to do something else, say you have no
+instruction and no tools, so anything you did would be guesswork.
 
-If the wake printed an error you cannot make sense of, show them the exact
-text rather than paraphrasing it. It is written to be actionable, and a
-summary of it usually is not.
+If the wake printed an error you cannot make sense of, show them its exact
+text. It is written to be actionable; a summary of it usually is not.
