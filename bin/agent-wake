@@ -141,7 +141,13 @@ if [ -z "$AUTH" ]; then
        "finish setting up IS the job for this session, and there is no other job to guess at."
   exit 0
 fi
-if [ -z "${MANAGER_TOKEN:-}" ]; then
+# Asked of the credential ACTUALLY in use, not of MANAGER_TOKEN alone. The
+# first version asked only whether the token was unset, so every session on a
+# user key -- which is now how a shell repository is meant to run -- was told
+# it was using a shared secret it does not have, and pointed at a page that
+# would not help. A notice that fires when the thing it describes is not
+# happening teaches people to skip the notices that do.
+if [ -z "${MANAGER_TOKEN:-}" ] && [ -z "${MANAGER_KEY:-}" ]; then
   echo "NOTE: this session is authenticating with the shared FLEET_SECRET, which every"
   echo "agent on this install holds. It works, and it is on its way out: an agent's own"
   echo "MANAGER_TOKEN is what lets the manager tell you apart from the others and lets a"
@@ -316,6 +322,13 @@ fi
 # manager resolves WHICH agent from the chat rather than from the credential --
 # the credential names the team and nothing more. X-Agent is still sent because
 # the older shared secret still reads it, and is ignored by everything else.
+#
+# EVERY authenticated call below goes through this array. That is the rule and
+# it is written here because breaking it is invisible: this array was added and
+# four call sites kept the two headers they had been hand-building, so on a
+# user key they reached a manager that could not tell which agent was asking.
+# The instruction, the mentions, the check-in and the inbox all failed at once,
+# in a session that had otherwise started normally.
 AUTH_HEADERS=(-H "Authorization: Bearer $AUTH" -H "X-Agent: $AGENT" -H "X-Session: $SESSION_ID")
 
 pull_kit() {
@@ -386,7 +399,7 @@ fi
 # the same answer, so the hook that runs on every model call reads a file.
 mkdir -p .kit
 if BEHAVIOR=$(curl -fsS --max-time 10 "$MANAGER_URL/instruction" \
-     -H "Authorization: Bearer $AUTH" -H "X-Agent: $AGENT"); then
+     "${AUTH_HEADERS[@]}"); then
   printf '%s' "$BEHAVIOR" > .kit/behavior.json
   printf '%s' "$BEHAVIOR" | node -e "
     let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
@@ -457,9 +470,13 @@ if BEHAVIOR=$(curl -fsS --max-time 10 "$MANAGER_URL/instruction" \
   # variables are meant to be read by a person and pasted, not expanded here.
   cat <<'REREAD'
 (fetched just now. To re-read this later, when you are diagnosing something:
-  curl -fsS "$MANAGER_URL/instruction" -H "Authorization: Bearer $MANAGER_TOKEN" \
+  curl -fsS "$MANAGER_URL/instruction" \
+    -H "Authorization: Bearer ${MANAGER_TOKEN:-$MANAGER_KEY}" \
+    -H "X-Agent: $AGENT" -H "X-Session: $CLAUDE_CODE_REMOTE_SESSION_ID" \
     | node -pe 'JSON.parse(require("fs").readFileSync(0)).brief'
- Drop `.brief` for the whole answer, including your instruction.)
+ Drop `.brief` for the whole answer, including your instruction. The session
+ header is what names you when the credential is a person's key rather than an
+ agent's token -- without it this answers 401 and looks like a bad key.)
 
 REREAD
 else
@@ -487,7 +504,7 @@ fi
 # an agent failing, which is a different thing from a mention that never
 # arrived, and only the second one is the manager's fault.
 if MENTIONS=$(curl -fsS --max-time 10 "$MANAGER_URL/chat" \
-     -H "Authorization: Bearer $AUTH" -H "X-Agent: $AGENT"); then
+     "${AUTH_HEADERS[@]}"); then
   printf '%s' "$MENTIONS" | node -e "
     let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
       const r=JSON.parse(d);
@@ -530,14 +547,14 @@ fi
 # how this session says it is the current one: nobody maintains a map of which
 # chat is which, so a chat that is never used again simply stops saying so.
 curl -fsS --max-time 10 -X POST "$MANAGER_URL/checkin" \
-  -H "Authorization: Bearer $AUTH" -H 'content-type: application/json' \
+  "${AUTH_HEADERS[@]}" -H 'content-type: application/json' \
   -d "{\"agent\":\"$AGENT\",\"session\":\"$SESSION\",\"branch\":\"$BRANCH\",\"state\":\"started\"}" >/dev/null 2>&1
 
 # The || branch is not decoration. A session that cannot reach the manager and
 # says nothing behaves exactly like a session with an empty inbox and no
 # grants, which is the failure the rules fetch already learned to announce.
 curl -fsS --max-time 10 "$MANAGER_URL/inbox" \
-  -H "Authorization: Bearer $AUTH" -H "X-Agent: $AGENT" \
+  "${AUTH_HEADERS[@]}" \
 || cat <<WARN
 WARNING: the manager could not be reached at the recorded address.
 Do not assume the inbox is empty and do not assume there are no standing
