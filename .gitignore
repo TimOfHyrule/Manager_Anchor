@@ -3,3 +3,11 @@
 # on this account where a slip would be visible to everybody immediately.
 .env
 .env.*
+
+# What the wake fetches from the manager each session. It is not source: it is
+# re-fetched every time, it goes stale the moment the manager changes, and
+# behavior.json carries this agent's own instructions and the brief written for
+# it. Named here for the same reason as the line above -- this repository is
+# public, and one `git add -A` puts all of that in a history that cannot be
+# taken back.
+.kit/
